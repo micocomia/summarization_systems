@@ -455,89 +455,168 @@ class DocumentProcessor:
 
     def _extract_topics(self, text: str, max_topics: int = 5) -> List[str]:
         """
-        Extract key topics from text using KeyBERT or HuggingFace transformers.
+        Extract key topics from text using K-means clustering on word embeddings.
         
         Args:
             text: The text to extract topics from
+            max_topics: Maximum number of topics/clusters to extract
+            
+        Returns:
+            List of topic keywords/phrases representing cluster centers
+        """
+        try:
+            # Import necessary libraries
+            from sklearn.cluster import KMeans
+            from sklearn.feature_extraction.text import CountVectorizer
+            import nltk
+            import numpy as np
+            
+            # Download NLTK resources if not already downloaded
+            try:
+                nltk.data.find('tokenizers/punkt')
+                nltk.data.find('corpora/stopwords')
+            except LookupError:
+                nltk.download('punkt', quiet=True)
+                nltk.download('stopwords', quiet=True)
+            
+            # Get stop words
+            from nltk.corpus import stopwords
+            stop_words = set(stopwords.words('english'))
+            
+            # Tokenize and clean text
+            from nltk.tokenize import word_tokenize
+            
+            # Split text into sentences for better context
+            sentences = nltk.sent_tokenize(text)
+            
+            # Filter out very short sentences
+            sentences = [s for s in sentences if len(s.split()) > 3]
+            
+            if not sentences:
+                return self._simple_topic_extraction(text, max_topics)
+            
+            # Generate sentence embeddings
+            sentence_embeddings = self.embedding_model.encode(sentences, show_progress_bar=False)
+            
+            # Determine appropriate number of clusters
+            # If we have very few sentences, reduce number of clusters
+            n_clusters = min(max_topics, len(sentences) // 2)
+            n_clusters = max(1, n_clusters)  # Ensure at least one cluster
+            
+            # Apply K-means clustering
+            kmeans = KMeans(n_clusters=n_clusters, random_state=42)
+            kmeans.fit(sentence_embeddings)
+            
+            # Identify central sentences for each cluster (closest to centroid)
+            closest_indices = []
+            for i in range(n_clusters):
+                # Get sentences in this cluster
+                cluster_indices = np.where(kmeans.labels_ == i)[0]
+                
+                if len(cluster_indices) == 0:
+                    continue
+                    
+                # Find the sentence closest to the cluster centroid
+                distances = np.linalg.norm(
+                    sentence_embeddings[cluster_indices] - kmeans.cluster_centers_[i].reshape(1, -1), 
+                    axis=1
+                )
+                closest_idx = cluster_indices[np.argmin(distances)]
+                closest_indices.append(closest_idx)
+            
+            # Extract keywords from the central sentences
+            central_sentences = [sentences[i] for i in closest_indices]
+            
+            # Use KeyBERT if available for more meaningful keywords
+            try:
+                from keybert import KeyBERT
+                
+                # Initialize the KeyBERT model
+                kw_model = KeyBERT(model=self.embedding_model)
+                
+                # Extract keywords from each central sentence
+                all_keywords = []
+                for sentence in central_sentences:
+                    keywords = kw_model.extract_keywords(
+                        sentence,
+                        keyphrase_ngram_range=(1, 2),
+                        stop_words='english',
+                        use_mmr=True,
+                        diversity=0.7,
+                        top_n=1  # Just get the top keyword per central sentence
+                    )
+                    if keywords:
+                        all_keywords.append(keywords[0][0])  # Add just the keyword, not the score
+                
+                # If we couldn't extract keywords from all clusters, fall back to extraction method
+                if len(all_keywords) < n_clusters // 2:
+                    return self._extract_keywords_from_sentences(central_sentences, max_topics)
+                    
+                return all_keywords[:max_topics]  # Return at most max_topics keywords
+                
+            except ImportError:
+                # Fall back to simpler keyword extraction method
+                return self._extract_keywords_from_sentences(central_sentences, max_topics)
+                
+        except (ImportError, Exception) as e:
+            # Fall back to the simple method if clustering fails
+            import logging
+            logging.warning(f"Clustering-based topic extraction failed with error: {e}")
+            return self._simple_topic_extraction(text, max_topics)
+
+    def _extract_keywords_from_sentences(self, sentences: List[str], max_topics: int = 5) -> List[str]:
+        """
+        Extract keywords from a list of central sentences using TF-IDF.
+        
+        Args:
+            sentences: List of central sentences from clusters
             max_topics: Maximum number of topics to extract
             
         Returns:
             List of topic keywords/phrases
         """
-        try:
-            # Option 1: Using KeyBERT (if installed)
-            from keybert import KeyBERT
-            
-            # Initialize the model - uses same sentence-transformers models
-            kw_model = KeyBERT(model=self.embedding_model)
-            
-            # Extract keywords/keyphrases
-            keywords = kw_model.extract_keywords(
-                text, 
-                keyphrase_ngram_range=(1, 2),  # Allow for single words or two-word phrases
-                stop_words='english',
-                use_mmr=True,  # Use Maximal Marginal Relevance for diversity
-                diversity=0.7,
-                top_n=max_topics
-            )
-            
-            # Return just the keywords without scores
-            return [keyword for keyword, _ in keywords]
+        from sklearn.feature_extraction.text import TfidfVectorizer
+        import numpy as np
         
-        except ImportError:
-            try:
-                # Option 2: Using Hugging Face transformers and NLTK directly
-                from transformers import pipeline
-                import nltk
-                from nltk.corpus import stopwords
+        # Combine sentences into a single corpus, but keep track of the original sentences
+        corpus = sentences
+        
+        # Create a TF-IDF vectorizer
+        vectorizer = TfidfVectorizer(
+            ngram_range=(1, 2),  # Consider single words and bigrams
+            stop_words='english',
+            max_features=100
+        )
+        
+        # Generate TF-IDF matrix
+        try:
+            tfidf_matrix = vectorizer.fit_transform(corpus)
+        except ValueError:
+            # Handle case when there's not enough data
+            return self._simple_topic_extraction(" ".join(sentences), max_topics)
+        
+        # Get feature names (words or bigrams)
+        feature_names = vectorizer.get_feature_names_out()
+        
+        # For each sentence, find the most important feature
+        keywords = []
+        for i, sent in enumerate(corpus):
+            if i >= len(tfidf_matrix.toarray()):
+                continue
                 
-                # Download NLTK resources if not already downloaded
-                try:
-                    nltk.data.find('tokenizers/punkt')
-                except LookupError:
-                    nltk.download('punkt', quiet=True)
-                
-                try:
-                    nltk.data.find('corpora/stopwords')
-                except LookupError:
-                    nltk.download('stopwords', quiet=True)
-                
-                # Get stop words
-                stop_words = set(stopwords.words('english'))
-                
-                # Use a zero-shot classification pipeline
-                classifier = pipeline("zero-shot-classification", 
-                                      model="facebook/bart-large-mnli")
-                
-                # Extract candidate topics (most frequent non-stopwords)
-                words = [word.lower() for word in nltk.word_tokenize(text) 
-                        if word.isalpha() and word.lower() not in stop_words and len(word) > 3]
-                
-                # Count frequencies
-                from collections import Counter
-                word_counts = Counter(words)
-                
-                # Get top candidate topics to feed into zero-shot
-                candidate_topics = [word for word, _ in word_counts.most_common(15)]
-                
-                if not candidate_topics:
-                    return []
-                
-                # For short texts, we might not get enough candidates
-                if len(candidate_topics) < max_topics:
-                    return candidate_topics
-                
-                # Use zero-shot classification to rank candidate topics
-                result = classifier(text, candidate_topics, multi_label=True)
-                
-                # Extract the top N topics based on scores
-                top_topics = [topic for score, topic in sorted(zip(result['scores'], result['labels']), 
-                                                              reverse=True)[:max_topics]]
-                return top_topics
-                
-            except (ImportError, ModuleNotFoundError):
-                # Fallback to a simpler method if none of the above libraries are available
-                return self._simple_topic_extraction(text, max_topics)
+            # Get the TF-IDF scores for this document
+            tfidf_scores = tfidf_matrix.toarray()[i]
+            
+            # Find the top scoring features for this document
+            top_indices = np.argsort(tfidf_scores)[-2:][::-1]  # Get top 2 features
+            
+            for idx in top_indices:
+                if tfidf_scores[idx] > 0:  # Only consider non-zero scores
+                    keywords.append(feature_names[idx])
+        
+        # Remove duplicates and limit to max_topics
+        unique_keywords = list(dict.fromkeys(keywords))
+        return unique_keywords[:max_topics]
         
     def _simple_topic_extraction(self, text: str, max_topics: int = 5) -> List[str]:
         """

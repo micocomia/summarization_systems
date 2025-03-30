@@ -3,6 +3,7 @@ import logging
 import re
 import os
 from typing import Dict, Any, List, Optional
+from google.protobuf.json_format import MessageToJson
 
 logger = logging.getLogger(__name__)
 
@@ -74,14 +75,14 @@ class IntentHandlerManager:
         intent_handlers = {
             "SummaryTask_Abstractive": self._handle_abstractive_summarization,
             "extractive_summarization": self._handle_extractive_summarization,
-            "document_qa": self._handle_document_qa,
+            "QA_Document": self._handle_document_qa,
             "summarization_info": self._handle_summarization_info,
             "show_settings": self._handle_show_settings,
             "upload_document": self._handle_upload_document,
-            "list_documents": self._handle_list_documents,
-            "fallback": self._handle_fallback
+            "Document_Status": self._handle_document_status,
+            "FallbackIntent": self._handle_fallback
         }
-        
+
         # Call the appropriate handler
         if intent_type in intent_handlers:
             response = intent_handlers[intent_type](intent_data)
@@ -93,6 +94,49 @@ class IntentHandlerManager:
                 response = self._handle_fallback(intent_data)
                 
         return response
+
+    def extract_sys_any_protobuf(parameter):
+        """
+        Extract values from a Dialogflow sys.any parameter using Protobuf's JSON converter.
+        
+        Args:
+            parameter: A protobuf message object (like from Dialogflow's sys.any)
+            
+        Returns:
+            Extracted value(s) as Python native types
+        """
+        try:
+            # Convert protobuf message to JSON string
+            serialized = MessageToJson(parameter)
+            
+            # Parse JSON string back to Python dict/list
+            parsed = json.loads(serialized)
+            
+            # Debug output
+            logger.debug(f"Converted protobuf to: {parsed}")
+            
+            # Extract values from common Dialogflow structures
+            if isinstance(parsed, dict):
+                # Try various common field names in Dialogflow responses
+                for field in ['values', 'items', 'listValue', 'value', 'stringValue']:
+                    if field in parsed:
+                        return parsed[field]
+                
+                # If there's only one key, return its value
+                if len(parsed) == 1:
+                    return list(parsed.values())[0]
+                
+                # Return the whole dict if we couldn't extract a specific field
+                return parsed
+            
+            return parsed
+        except Exception as e:
+            logger.error(f"Error converting protobuf to JSON: {str(e)}")
+            # Fallback to string representation if JSON conversion fails
+            try:
+                return str(parameter)
+            except:
+                return None
     
     def _handle_abstractive_summarization(self, intent_data: Dict[str, Any]) -> Dict[str, Any]:
         """Handle abstractive summarization intent."""
@@ -127,17 +171,21 @@ class IntentHandlerManager:
                 focus_topics=focus_topics if focus_topics else None
             )
             
-            # Build response with summary and metadata
-            summary_text = summary_result["summary"]
-            metadata = summary_result["metadata"]
-            
-            source_info = ""
-            if "source_documents" in metadata and metadata["source_documents"]:
-                source_docs = metadata["source_documents"]
-                source_info = f"\n\n\nSource(s): {', '.join(source_docs)}"
-            
-            # Create response with length information
-            response_text = f"{summary_text}{source_info}"
+            # Use the summary with embedded citations and sources
+            if "summary_with_sources" in summary_result:
+                # This is the summary text with citations and source list at the end
+                response_text = summary_result["summary_with_sources"]
+            else:
+                # Fallback to older format if the new field isn't available
+                summary_text = summary_result["summary"]
+                metadata = summary_result["metadata"]
+                
+                source_info = ""
+                if "source_documents" in metadata and metadata["source_documents"]:
+                    source_docs = metadata["source_documents"]
+                    source_info = f"\n\n\nSource(s): {', '.join(source_docs)}"
+                
+                response_text = f"{summary_text}{source_info}"
             
             return {
                 "text": response_text,
@@ -149,7 +197,7 @@ class IntentHandlerManager:
             return {
                 "text": "I encountered an error while trying to generate a summary. Please try again or try with different settings."
             }
-    
+        
     def _handle_extractive_summarization(self, intent_data: Dict[str, Any]) -> Dict[str, Any]:
         """Handle extractive summarization intent."""
         return {
@@ -274,6 +322,58 @@ class IntentHandlerManager:
         return {
             "text": "To upload a document, you can use the file upload button below. I support PDF and PPTX files."
         }
+
+    def _handle_document_status(self, intent_data: Dict[str, Any]) -> Dict[str, Any]:
+        """
+        Handle requests to check status of uploaded documents and their topics.
+        
+        Args:
+            intent_data: Intent data from Dialogflow
+            
+        Returns:
+            Response with document status information
+        """
+        if not self.session.documents_loaded:
+            return {
+                "text": "You haven't uploaded any documents yet. Use the file upload button to add documents."
+            }
+        
+        # Get list of document names
+        document_names = self.session.document_names if hasattr(self.session, 'document_names') else []
+        
+        # Get topics from the retrieval system
+        topics = []
+        try:
+            if self.retrieval_system:
+                topics = self.retrieval_system.get_available_topics()
+        except Exception as e:
+            logger.error(f"Error retrieving topics: {str(e)}")
+        
+        # Build the response
+        doc_count = len(document_names)
+        response_text = f"You have {doc_count} document{'s' if doc_count != 1 else ''} uploaded:\n\n"
+        
+        # List documents
+        for i, doc_name in enumerate(document_names):
+            response_text += f"{i+1}. {doc_name}\n"
+        
+        # Add topics section if any were found
+        if topics:
+            response_text += f"\nI've identified the following topics in your documents:\n"
+            for topic in topics:
+                response_text += f"- {topic}\n"
+        else:
+            response_text += "\nNo specific topics were identified in your documents."
+        
+        # Add instructions for what they can do next
+        response_text += "\n\nYou can now:\n"
+        response_text += "- Ask for an abstractive summary (short, medium, or long)\n"
+        response_text += "- Ask questions about specific content in the documents\n"
+        response_text += "- Request a summary focused on specific topics"
+        
+        return {
+            "text": response_text
+    }
     
     def _handle_list_documents(self, intent_data: Dict[str, Any]) -> Dict[str, Any]:
         """List currently loaded documents."""
@@ -291,16 +391,16 @@ class IntentHandlerManager:
     def _handle_fallback(self, intent_data: Dict[str, Any]) -> Dict[str, Any]:
         """Handle fallback intent."""
         # Get the fulfillment text from Dialogflow if available
-        response = intent_data.get("fulfillment_text", "")
-        
-        if not response:
-            if not self.session.documents_loaded:
-                response = "I didn't understand that. You can upload documents using the file button below, or ask me about summarization systems."
-            else:
-                response = "I didn't understand that. Since you have documents loaded, I'll try to answer as a question about your documents.\n\n"
+
+        if not self.session.documents_loaded:
+            response = "Hello! You can upload documents using the file button below, or ask me about summarization systems."
+        else:
+            try:
                 # Try to handle as a document QA intent
                 qa_response = self._handle_document_qa(intent_data)
                 response += qa_response["text"]
+            except:
+                response = "I tried querying the document but was unable to find anything."
         
         return {
             "text": response

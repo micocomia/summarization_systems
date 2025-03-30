@@ -5,7 +5,7 @@ import numpy as np
 import requests
 import json
 import os
-
+import re
 logger = logging.getLogger(__name__)
 
 class AbstractiveSummarizer:
@@ -52,6 +52,30 @@ class AbstractiveSummarizer:
         except Exception as e:
             self.ollama_available = False
             logger.warning(f"Ollama integration not available: {e}")
+
+    def _preprocess_context_citations(self, context_text: str) -> str:
+        """
+        Preprocess the context to handle existing citation patterns.
+        This prevents the model from copying existing citations.
+        
+        Args:
+            context_text: The raw context text with potential existing citations
+            
+        Returns:
+            Processed context with existing citations transformed
+        """
+        # Pattern to detect existing citations like [21], [22], etc.
+        existing_citation_pattern = r'\[(\d+)\]'
+        
+        # Function to replace citation with a descriptive text
+        def replace_citation(match):
+            citation_num = match.group(1)
+            return f"(document reference {citation_num})"
+        
+        # Replace existing citations with descriptive text
+        processed_context = re.sub(existing_citation_pattern, replace_citation, context_text)
+        
+        return processed_context
 
     def generate_summary(self, length: str = "medium", focus_topics: Optional[List[str]] = None) -> Dict[str, Any]:
         """
@@ -123,7 +147,31 @@ class AbstractiveSummarizer:
                 }
             }
         
-        # Extract metadata about the sources
+        # Create a mapping of contexts to their source information for citation
+        context_sources = {}
+        sources = []
+        
+        for i, ctx in enumerate(contexts):
+            if "metadata" in ctx and "source" in ctx["metadata"]:
+                source = ctx["metadata"]["source"]
+                page = ctx["metadata"].get("page_number", "")
+                source_info = {"title": source, "page": page, "index": len(sources) + 1}
+                
+                # Find unique sources
+                source_exists = False
+                for existing_source in sources:
+                    if existing_source["title"] == source and existing_source["page"] == page:
+                        source_exists = True
+                        source_info = existing_source  # Use existing source reference
+                        break
+                
+                if not source_exists:
+                    sources.append(source_info)
+                
+                # Map context to its source for citation
+                context_sources[i] = source_info
+        
+        # Extract metadata about the sources and topics
         source_documents = set()
         topics = set()
         for ctx in contexts:
@@ -136,8 +184,18 @@ class AbstractiveSummarizer:
                     elif isinstance(ctx["metadata"]["topics"], str):
                         topics.update([t.strip() for t in ctx["metadata"]["topics"].split(',')])
         
-        # Combine contexts for the prompt
-        context_text = "\n\n".join([ctx["content"] for ctx in contexts])
+        context_text = ""
+        for i, ctx in enumerate(contexts):
+            # Get citation marker
+            citation = ""
+            if i in context_sources:
+                citation = f" [{context_sources[i]['index']}]"
+            
+            # Preprocess the content to handle existing citations
+            processed_content = self._preprocess_context_citations(ctx['content'])
+            
+            # Add to processed context text
+            context_text += f"Context {i+1}{citation}:\n{processed_content}\n\n"
         
         # Generate the summary
         summary = ""
@@ -145,33 +203,45 @@ class AbstractiveSummarizer:
         # Try Ollama first if available
         if self.ollama_available and self.use_ollama:
             try:
-                summary = self._generate_with_ollama(context_text, target)
+                summary = self._generate_with_ollama(context_text, target, sources)
             except Exception as e:
                 logger.warning(f"Ollama summarization failed: {e}")
                 summary = ""
         
         # Fallback for simple summarization if needed
         if not summary:
-            summary = self._generate_simple_summary(context_text, target)
-            
+            summary = self._generate_simple_summary_with_citations(context_text, target, sources)
+        
+        sources_text = ""
+        if sources:
+            # If no citations were used but we have sources, include all sources
+            sources_text = "\n\nSources:\n"
+            for source in sources:
+                sources_text += f"\n\n[{source['index']}] {source['title']}"
+                if source['page']:
+                    sources_text += f", page {source['page']}"
+                sources_text += "\n"
+        
         # Return with metadata
         return {
             "summary": summary,
+            "summary_with_sources": summary + sources_text,  # Now includes sources based on conditional logic
             "metadata": {
                 "length": length,
                 "word_count": len(summary.split()),
                 "focus_topics": list(topics) if focus_topics is None else focus_topics,
                 "source_documents": list(source_documents),
-                "context_count": len(contexts)
+                "context_count": len(contexts),
+                "sources": sources,  # All available sources
             }
         }
-    
-    def _generate_with_ollama(self, context: str, target: Dict[str, Any]) -> str:
-        """Generate a summary using Ollama."""
+
+    def _generate_with_ollama(self, context: str, target: Dict[str, Any], sources: List[Dict[str, Any]]) -> str:
+        """Generate a summary using Ollama with embedded citations."""
         import requests
         
-        # Create the prompt for abstractive summarization
-        prompt = self._create_summary_prompt(context, target)
+        # Create the prompt for abstractive summarization with citations
+        prompt = self._create_summary_prompt_with_citations(context, target, sources)
         
         # Prepare the request to Ollama
         data = {
@@ -202,8 +272,35 @@ class AbstractiveSummarizer:
             logger.error(f"Ollama API error: {response.status_code} - {response.text}")
             return ""
     
-    def _create_summary_prompt(self, context: str, target: Dict[str, Any]) -> str:
-        """Create a prompt for summary generation."""
+    def _create_summary_prompt_with_citations(self, context: str, target: Dict[str, Any], sources: List[Dict[str, Any]]) -> str:
+        """Create a prompt for summary generation with enhanced citation instructions."""
+        # Create citation instructions if sources exist
+        citation_instructions = ""
+        if sources:
+            # List out all valid citation numbers to make them explicit
+            valid_citations = ", ".join([f"[{source['index']}]" for source in sources])
+            
+            citation_instructions = f"""
+            CITATION REQUIREMENTS (VERY IMPORTANT):
+            1. ONLY use these specific citation numbers: {valid_citations}
+            2. DO NOT create your own citation numbers like [21], [22], etc.
+            3. When citing, use EXACTLY the citation numbers from the Context sections.
+            4. For Context 1 [1], use citation [1]. For Context 5 [3], use citation [3].
+            5. Place citations [X] immediately after the specific information they support.
+            6. Do not group citations at the end of sentences or paragraphs.
+            7. Each piece of information should be cited individually.
+            8. Do not reference context numbers in your summary (e.g., do not write "as mentioned in Context 3").
+            9. Include at least one citation in each key point and multiple citations in the main summary.
+            10. The citations in your summary MUST MATCH the source numbers provided in the context.
+            11. Some context passages may contain references in the format (document reference X)
+            12. These are existing citations from the original document
+            13. DO NOT reproduce these as [X] in your summary
+                        
+            CITATION EXAMPLE:
+            WRONG: "The study showed significant results for multiple metrics [21]."
+            RIGHT: "The study showed significant results for multiple metrics [3]." (assuming Context N [3])
+            """
+        
         return f"""
         You are a professional summarizer. Create a {target["description"]} and cohesive abstractive summary of the following content.
 
@@ -214,69 +311,129 @@ class AbstractiveSummarizer:
         1. DO NOT GENERATE information that cannot be found in the content.
         2. When defining acronyms, define using the provided content. Else, keep the acronym as is.
         3. Capture the main ideas, conclusions, and important details
-        4. Provide a brief overview of the content using 1 to 2 short sentences.
-        5. Provide 3 key points regarding the content.
-        6. The MAIN SUMMARY should be written in a cohesive, flowing style that is composed of paragraph(s).
+        4. Provide 3 key points about the content to summarize. Each point should not exceed 20 words.
+        5. The MAIN SUMMARY should be written in a cohesive, flowing style that is composed of paragraph(s).
+        6. STRICTLY follow the format in Summary Output Requirements. Key Points are followed by the Main Summary.
         7. ONLY INCLUDE information present in the original text.
-        8. DO NOT ADD any information that is irrelevant to the content.
         9. Avoid repetition and focus on the most important information
         10. Use clear and concise language
-        11. Be able to stand alone as a document
-        12. DO NOT add introductory or closing text. STRICTLY follow the format in Summary Output Requirements.
+        12. CRITICAL: DO NOT ADD ANY NOTES, DISCLAIMERS, OR COMMENTS ABOUT FOLLOWING THE REQUIREMENTS. Your response should ONLY contain the Key Points and Summary sections, nothing else.
+        13. If there is not enough context to fulfill the length requirements, do not pad the summary with unnecessary content.
+        14. DO NOT ADD a references section after the summary as this would be handled separately.
+        {citation_instructions}
         
         SUMMARY OUTPUT REQUIREMENTS:
-        Brief Overview:
-        "BRIEF OVERVIEW HERE"
-
         Key Points:
-        1. "Key Point 1 Here"
-        2. "Key Point 2 here"
-        3. "Key Point 3 Here"
+        1. Key Point 1 Here [Include citations]
+        2. Key Point 2 Here [Include citations]
+        3. Key Point 3 Here [Include citations]
 
         Summary:
-        "MAIN SUMMARY HERE"
+        MAIN SUMMARY HERE [With inline citations]
+
+        FINAL CRITICAL INSTRUCTION: Do NOT add any statements about having followed the requirements. The output should contain ONLY the Key Points and Summary as specified above.
         """
     
-    def _generate_simple_summary(self, context: str, target: Dict[str, Any]) -> str:
-        """Generate a simple extractive summary when LLM is not available."""
-        # Split into sentences
+    def _generate_simple_summary_with_citations(self, context: str, target: Dict[str, Any], sources: List[Dict[str, Any]]) -> str:
+        """Generate a simple extractive summary with citations when LLM is not available."""
         import re
-        sentences = [s.strip() for s in re.split(r'(?<=[.!?])\s+', context) if len(s.strip()) > 20]
         
-        if not sentences:
+        # Extract contexts with their citation markers
+        context_chunks = []
+        citation_pattern = r"Context (\d+)(?:\s+\[(\d+)\])?:\n(.*?)(?=\n\nContext|\Z)"
+        matches = re.finditer(citation_pattern, context, re.DOTALL)
+        
+        for match in matches:
+            context_id = int(match.group(1))
+            citation = match.group(2)
+            content = match.group(3).strip()
+            
+            context_chunks.append({
+                "id": context_id,
+                "citation": citation,
+                "content": content
+            })
+        
+        # Extract sentences from each context with citation info
+        all_sentences = []
+        for chunk in context_chunks:
+            sentences = [s.strip() for s in re.split(r'(?<=[.!?])\s+', chunk["content"]) if len(s.strip()) > 20]
+            for sentence in sentences:
+                all_sentences.append({
+                    "text": sentence,
+                    "citation": chunk["citation"]
+                })
+        
+        if not all_sentences:
             return "No content available to summarize."
         
-        # Extract important sentences
+        # Score sentences
         sentence_scores = {}
         
-        # Score based on position (earlier sentences often more important)
-        for i, sentence in enumerate(sentences):
-            # Decay score as we progress through the document
-            position_score = 1.0 / (1 + 0.1 * i)
-            sentence_scores[sentence] = position_score
-        
-        # Score based on presence of important words
+        # Important words to look for when scoring sentences
         important_words = ["important", "significant", "key", "main", "critical", 
                            "essential", "primary", "fundamental", "crucial", "major",
                            "conclusion", "result", "finding", "determine", "show", 
                            "demonstrate", "reveal", "highlight", "indicate", "prove"]
         
-        for sentence in sentences:
+        for i, sentence_data in enumerate(all_sentences):
+            sentence = sentence_data["text"]
+            # Position score - earlier sentences often more important
+            position_score = 1.0 / (1 + 0.1 * i)
+            
+            # Importance score - based on presence of key terms
+            importance_score = 0
             for word in important_words:
                 if word in sentence.lower():
-                    sentence_scores[sentence] = sentence_scores.get(sentence, 0) + 0.2
+                    importance_score += 0.2
+                    
+            # Combine scores
+            sentence_scores[i] = position_score + importance_score
         
-        # Sort sentences by score
-        sorted_sentences = sorted(sentence_scores.items(), key=lambda x: x[1], reverse=True)
+        # Get top sentences based on scores
+        sorted_indices = sorted(sentence_scores.keys(), key=lambda x: sentence_scores[x], reverse=True)
         
-        # Get top sentences based on target length
-        target_sentences = min(max(3, target["words"] // 25), len(sorted_sentences))
-        top_sentences = [sentence for sentence, score in sorted_sentences[:target_sentences]]
+        # Calculate number of sentences to include based on target length
+        target_sentences = min(max(3, target["words"] // 25), len(sorted_indices))
         
-        # Re-order sentences to maintain original flow
-        original_order_sentences = [s for s in sentences if s in top_sentences]
+        # Get the top-scoring sentences
+        top_indices = sorted_indices[:target_sentences]
         
-        # Combine into summary
-        summary = " ".join(original_order_sentences)
+        # Sort indices by their original order to maintain document flow
+        top_indices.sort()
         
+        # Build the summary with citations
+        summary_parts = []
+        for idx in top_indices:
+            sentence = all_sentences[idx]["text"]
+            citation = all_sentences[idx]["citation"]
+            
+            if citation:
+                summary_parts.append(f"{sentence} [{citation}]")
+            else:
+                summary_parts.append(sentence)
+                
+        # Combine into a summary
+        summary = " ".join(summary_parts)
+        
+        # Add key points section
+        if len(top_indices) >= 3:
+            key_points = []
+            # Use the top 3 sentences as key points
+            for i in range(min(3, len(top_indices))):
+                idx = sorted_indices[i]
+                sentence = all_sentences[idx]["text"]
+                citation = all_sentences[idx]["citation"]
+                
+                if citation:
+                    key_points.append(f"{sentence} [{citation}]")
+                else:
+                    key_points.append(sentence)
+                    
+            key_points_text = "Key Points:\n"
+            for i, point in enumerate(key_points):
+                key_points_text += f"{i+1}. {point}\n"
+                
+            summary = f"{key_points_text}\nSummary:\n{summary}"
+            
         return summary

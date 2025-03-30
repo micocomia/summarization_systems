@@ -48,7 +48,6 @@ def initialize_systems():
     if st.session_state.initialized:
         return
     
-    print("Here")
     # Document Processor
     st.session_state.document_processor = DocumentProcessor(
         embedding_model="all-MiniLM-L6-v2",
@@ -56,36 +55,29 @@ def initialize_systems():
         chunk_overlap=100,
     )
 
-    print("Document Processor Initialized")
-
     # Vector store for document storage
     st.session_state.vector_store = VectorStore(
         collection_name="document_collection",
         persist_directory="./data/vector_store"
     )
 
-    print("Vector Store Initialized")
-    
+    # Clear the vector store to start fresh
+    st.session_state.vector_store.clear()
+
     # Retrieval system for finding relevant content
     st.session_state.retrieval_system = RetrievalSystem(
         vector_store=st.session_state.vector_store
     )
 
-    print("Retrieval System Initialized")
-
     # Dialogflow integration for intent classification
     st.session_state.dialogflow = DialogflowIntegration()
     
-    print("Dialogflow Initialized")
-
     # Abstractive summarizer
     st.session_state.abstractive_summarizer = AbstractiveSummarizer(
         retrieval_system=st.session_state.retrieval_system,
         use_ollama=True
     )
     
-    print("Abstractive Summarizer Initialized")
-
     # Document QA
     st.session_state.document_qa = DocumentQA(
         retrieval_system=st.session_state.retrieval_system,
@@ -171,20 +163,21 @@ def process_uploaded_file(uploaded_file, is_part_of_batch=False):
             # Add processed chunks to vector store
             st.session_state.vector_store.add_documents(processed_chunks)
             
-            # Update session state
+            # Update session state with document info
             st.session_state.documents.append(file_path)
             st.session_state.document_names.append(uploaded_file.name)
-            
-            # Extract topics from the first chunk's metadata
+
+            # Extract topics from the first chunk's metadata and update the session state
             if "metadata" in processed_chunks[0] and "topics" in processed_chunks[0]["metadata"]:
                 topics = processed_chunks[0]["metadata"]["topics"]
                 for topic in topics:
                     if topic not in st.session_state.topics:
                         st.session_state.topics.append(topic)
-                    
-            # Update the session to indicate documents are loaded
+
+            # Also, update the session context for the intent handler
             st.session_state.intent_handler.session.documents_loaded = True
-                
+            st.session_state.intent_handler.session.document_names = st.session_state.document_names
+
             # Update the latest assistant message with success info (only if not part of batch)
             if not is_part_of_batch:
                 st.session_state.messages[-1]["content"] = (
@@ -330,7 +323,7 @@ def main():
         # Display a placeholder when no conversation has started
         st.markdown("""
         <div style="display: flex; justify-content: center; align-items: center; height: 60vh; text-align: center;">
-            <div style="padding: 1.5rem; border-radius: 0.5rem; background-color: #f0e96e; color: #616054; max-width: 600px;">
+            <div style="padding: 1.5rem; border-radius: 0.5rem; background-color: #f0e96e; color: black; max-width: 600px;">
                 <h2>Start chatting with Summi</h2>
                 <p>Upload your documents or ask a question about summarization systems to begin.</p>
                 <p>For summaries, specify the type and length.</p>

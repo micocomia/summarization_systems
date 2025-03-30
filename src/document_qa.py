@@ -53,8 +53,32 @@ class DocumentQA:
             self.ollama_available = False
             logger.warning(f"Ollama integration not available: {e}")
 
+    def _preprocess_context_citations(self, context_text: str) -> str:
+        """
+        Preprocess the context to handle existing citation patterns.
+        This prevents the model from copying existing citations.
+        
+        Args:
+            context_text: The raw context text with potential existing citations
+            
+        Returns:
+            Processed context with existing citations transformed
+        """
+        # Pattern to detect existing citations like [21], [22], etc.
+        existing_citation_pattern = r'\[(\d+)\]'
+        
+        # Function to replace citation with a descriptive text
+        def replace_citation(match):
+            citation_num = match.group(1)
+            return f"(document reference {citation_num})"
+        
+        # Replace existing citations with descriptive text
+        processed_context = re.sub(existing_citation_pattern, replace_citation, context_text)
+        
+        return processed_context
+
     def answer_question_with_context(self, question: str, conversation_history: List[Dict[str, str]], 
-                                max_context_items: int = 100) -> Dict[str, Any]:
+                            max_context_items: int = 100) -> Dict[str, Any]:
         """
         Answer a question based on document content and previous conversation context.
         
@@ -66,6 +90,10 @@ class DocumentQA:
         Returns:
             Dictionary with answer and metadata
         """
+        # Check if this is a topic question
+        if self._is_topic_question(question):
+            return self._answer_topic_question(question)
+
         # Check if this might be a follow-up question
         is_followup = self._detect_followup_question(question)
         
@@ -95,18 +123,43 @@ class DocumentQA:
                 "sources": []
             }
         
-        # Extract source information for citation
+        # Create a mapping of contexts to their source information for citation
+        context_sources = {}
         sources = []
-        for ctx in contexts:
+        
+        for i, ctx in enumerate(contexts):
             if "metadata" in ctx and "source" in ctx["metadata"]:
                 source = ctx["metadata"]["source"]
                 page = ctx["metadata"].get("page_number", "")
-                source_info = {"title": source, "page": page}
-                if source_info not in sources:
+                source_info = {"title": source, "page": page, "index": len(sources) + 1}
+                
+                # Find unique sources
+                source_exists = False
+                for existing_source in sources:
+                    if existing_source["title"] == source and existing_source["page"] == page:
+                        source_exists = True
+                        source_info = existing_source  # Use existing source reference
+                        break
+                
+                if not source_exists:
                     sources.append(source_info)
+                
+                # Map context to its source for citation
+                context_sources[i] = source_info
         
-        # Combine contexts for the prompt
-        context_text = "\n\n".join([f"Context {i+1}:\n{ctx['content']}" for i, ctx in enumerate(contexts)])
+        # Prepare contexts with citation markers for the prompt
+        context_text = ""
+        for i, ctx in enumerate(contexts):
+            # Get citation marker
+            citation = ""
+            if i in context_sources:
+                citation = f" [{context_sources[i]['index']}]"
+            
+            # Preprocess the content to handle existing citations
+            processed_content = self._preprocess_context_citations(ctx['content'])
+            
+            # Add to processed context text
+            context_text += f"Context {i+1}{citation}:\n{processed_content}\n\n"
         
         # Generate the answer
         answer = ""
@@ -115,11 +168,12 @@ class DocumentQA:
         # Try Ollama first if available
         if self.ollama_available and self.use_ollama:
             try:
-                # Include conversation history in the prompt
-                answer_data = self._generate_with_ollama_and_history(
+                # Include conversation history and citation instructions in the prompt
+                answer_data = self._generate_with_ollama_and_citations(
                     question, 
                     context_text, 
-                    conversation_history if is_followup else []
+                    conversation_history if is_followup else [],
+                    sources
                 )
                 answer = answer_data["answer"]
                 confidence = answer_data["confidence"]
@@ -129,31 +183,31 @@ class DocumentQA:
         
         # Fallback if needed
         if not answer:
-            answer_data = self._generate_simple_answer(question, context_text)
+            answer_data = self._generate_simple_answer_with_citations(question, context_text, sources)
             answer = answer_data["answer"]
             confidence = answer_data["confidence"]
-            
+        
+        # Add a sources section at the end using conditional logic
+        sources_text = ""
+        if sources:
+            # If no citations were used but we have sources, include all sources
+            sources_text = "\n\nSources:\n"
+            for source in sources:
+                sources_text += f"\n\n[{source['index']}] {source['title']}"
+                if source['page']:
+                    sources_text += f", page {source['page']}"
+                sources_text += "\n"
+
         # Return with metadata
         result = {
             "answer": answer,
             "confidence": confidence,
-            "sources": sources
+            "sources": sources,  # Include all sources if none were cited
+            "answer_with_citations": answer + sources_text
         }
         
-        # Add citations to the answer if sources are available
-        if sources:
-            sources_text = "\n\n\nSources:\n\n"
-            for i, source in enumerate(sources):
-                sources_text += f"\n\n[{i+1}] {source['title']}"
-                if source['page']:
-                    sources_text += f", page {source['page']}"
-                    
-            result["answer_with_citations"] = answer + sources_text
-        else:
-            result["answer_with_citations"] = answer
-            
         return result
-    
+
     def _detect_followup_question(self, question: str) -> bool:
         """
         Detect if a question is likely a follow-up to a previous question.
@@ -201,13 +255,14 @@ class DocumentQA:
         
         return False
     
-    def _generate_with_ollama_and_history(self, question: str, context: str, 
-                                         conversation_history: List[Dict[str, str]]) -> Dict[str, Any]:
-        """Generate an answer using Ollama with conversation history."""
+    def _generate_with_ollama_and_citations(self, question: str, context: str, 
+                                         conversation_history: List[Dict[str, str]],
+                                         sources: List[Dict[str, Any]]) -> Dict[str, Any]:
+        """Generate an answer using Ollama with conversation history and embedded citations."""
         import requests
         
-        # Create prompt for QA with conversation history
-        prompt = self._create_qa_prompt_with_history(question, context, conversation_history)
+        # Create prompt for QA with conversation history and citation instructions
+        prompt = self._create_qa_prompt_with_citations(question, context, conversation_history, sources)
         
         # Prepare the request to Ollama
         data = {
@@ -254,9 +309,10 @@ class DocumentQA:
                 "confidence": 0.0
             }
     
-    def _create_qa_prompt_with_history(self, question: str, context: str, 
-                                      conversation_history: List[Dict[str, str]]) -> str:
-        """Create a prompt for QA with conversation history."""
+    def _create_qa_prompt_with_citations(self, question: str, context: str, 
+                                      conversation_history: List[Dict[str, str]],
+                                      sources: List[Dict[str, Any]]) -> str:
+        """Create a prompt for QA with conversation history and enhanced citation instructions."""
         
         # Format conversation history if available
         conversation_context = ""
@@ -265,6 +321,33 @@ class DocumentQA:
             for i, exchange in enumerate(conversation_history[-3:]):  # Use last 3 exchanges at most
                 conversation_context += f"User: {exchange['question']}\n"
                 conversation_context += f"Assistant: {exchange['answer']}\n\n"
+        
+        # Create enhanced citation instructions if sources exist
+        citation_instructions = ""
+        if sources:
+            # List out all valid citation numbers to make them explicit
+            valid_citations = ", ".join([f"[{source['index']}]" for source in sources])
+            
+            citation_instructions = f"""
+            CITATION REQUIREMENTS (VERY IMPORTANT):
+            1. ONLY use these specific citation numbers: {valid_citations}
+            2. DO NOT create your own citation numbers like [21], [22], etc.
+            3. When citing, use EXACTLY the citation numbers from the Context sections.
+            4. For Context 1 [1], use citation [1]. For Context 5 [3], use citation [3].
+            5. Place citations [X] immediately after the specific information they support.
+            6. Do not group citations at the end of sentences or paragraphs.
+            7. Each piece of information should be cited individually.
+            8. Do not reference context numbers in your answer (e.g., do not write "as mentioned in Context 3").
+            9. Include at least one citation in your answer, preferably multiple citations for different pieces of information.
+            10. The citations in your answer MUST MATCH the source numbers provided in the context.
+            11. Some context passages may contain references in the format (document reference X)
+            12. These are existing citations from the original document
+            13. DO NOT reproduce these as [X] in your summary
+            
+            CITATION EXAMPLE:
+            WRONG: "The product launched in March 2022 with positive reception [21]."
+            RIGHT: "The product launched in March 2022 [2] with positive reception [4]." (assuming Context 2 [2] and Context 4 [4])
+            """
         
         return f"""
         Answer the following question based on the provided context and conversation history.
@@ -277,49 +360,89 @@ class DocumentQA:
         Current Question: {question}
 
         IMPORTANT REQUIREMENTS:
-        1. Use only information from the provided context to answer the question
+        1. Use ONLY information from the provided context to answer the question
         2. For acronyms, pull information from the provided context to define the acronym. Otherwise, just leave the acronym as is.
         3. If the context doesn't contain the answer, say "I don't have enough information to answer that question"
         4. Take into account the conversation history for context when answering follow-up questions
         5. Keep answers concise and to the point
         6. Don't make up information or use prior knowledge
         7. Format your answer as readable text, not as a continuation of the prompt
-        8. Do not add any introductory or closing text that is not relevant to the question
-        9. If inferring from the provided conversation history, do not mention you are inferring from the conversation history
+        8. If inferring from the provided conversation history, do not mention you are inferring from the conversation history
+        9. DO NOT ADD a references section after the answer as this would be handled separately
+        10. CRITICAL: DO NOT ADD ANY NOTES, DISCLAIMERS, OR COMMENTS ABOUT FOLLOWING THE REQUIREMENTS. Your response should ONLY contain the direct answer to the question, nothing else.
+        {citation_instructions}
         
         Answer:
+
+        FINAL CRITICAL INSTRUCTION: Do NOT add any statements about having followed the requirements or about what you've done. The output should contain ONLY your direct answer to the question.
         """
     
-    def _generate_simple_answer(self, question: str, context: str) -> Dict[str, Any]:
-        """Generate a simple answer when LLM is not available."""
+    def _generate_simple_answer_with_citations(self, question: str, context: str, 
+                                          sources: List[Dict[str, Any]]) -> Dict[str, Any]:
+        """Generate a simple answer with embedded citations when LLM is not available."""
         import re
-        import random
         
-        # Extract sentences from the context
-        sentences = [s.strip() for s in re.split(r'(?<=[.!?])\s+', context) if len(s.strip()) > 10]
+        # Extract contexts with their citation markers
+        context_chunks = []
+        citation_pattern = r"Context (\d+)(?:\s+\[(\d+)\])?:\n(.*?)(?=\n\nContext|\Z)"
+        matches = re.finditer(citation_pattern, context, re.DOTALL)
         
-        if not sentences:
+        for match in matches:
+            context_id = int(match.group(1))
+            citation = match.group(2)
+            content = match.group(3).strip()
+            
+            context_chunks.append({
+                "id": context_id,
+                "citation": citation,
+                "content": content
+            })
+        
+        # Extract sentences from each context with citation info
+        all_sentences = []
+        for chunk in context_chunks:
+            sentences = [s.strip() for s in re.split(r'(?<=[.!?])\s+', chunk["content"]) if len(s.strip()) > 10]
+            for sentence in sentences:
+                all_sentences.append({
+                    "text": sentence,
+                    "citation": chunk["citation"]
+                })
+        
+        if not all_sentences:
             return {
                 "answer": "I couldn't find relevant information to answer that question.",
                 "confidence": 0.0
             }
         
-        # Very basic keyword matching
+        # Basic keyword matching
         question_words = set(question.lower().split())
         sentence_scores = {}
         
         # Score each sentence based on word overlap with the question
-        for sentence in sentences:
+        for i, sentence_data in enumerate(all_sentences):
+            sentence = sentence_data["text"]
             sentence_words = set(sentence.lower().split())
             overlap = len(question_words.intersection(sentence_words))
-            sentence_scores[sentence] = overlap
+            sentence_scores[i] = overlap
         
         # Get highest scoring sentences
-        sorted_sentences = sorted(sentence_scores.items(), key=lambda x: x[1], reverse=True)
+        sorted_indices = sorted(sentence_scores.keys(), key=lambda x: sentence_scores[x], reverse=True)
         
         # Take top 2-3 sentences
-        top_count = min(3, len(sorted_sentences))
-        answer_sentences = [s for s, _ in sorted_sentences[:top_count] if sentence_scores[s] > 0]
+        top_count = min(3, len(sorted_indices))
+        answer_sentences = []
+        
+        for i in range(top_count):
+            if i < len(sorted_indices) and sentence_scores[sorted_indices[i]] > 0:
+                sent_idx = sorted_indices[i]
+                sentence = all_sentences[sent_idx]["text"]
+                citation = all_sentences[sent_idx]["citation"]
+                
+                # Add citation if available
+                if citation:
+                    answer_sentences.append(f"{sentence} [{citation}]")
+                else:
+                    answer_sentences.append(sentence)
         
         if not answer_sentences:
             return {
@@ -332,10 +455,47 @@ class DocumentQA:
         
         # Calculate confidence based on keyword matching
         max_possible_overlap = len(question_words)
-        highest_overlap = sentence_scores[sorted_sentences[0][0]] if sorted_sentences else 0
+        highest_overlap = sentence_scores[sorted_indices[0]] if sorted_indices else 0
         confidence = min(0.9, highest_overlap / max_possible_overlap) if max_possible_overlap > 0 else 0.3
         
         return {
             "answer": answer,
             "confidence": confidence
         }
+    
+    def _is_topic_question(self, question: str) -> bool:
+        """Detect if a question is asking about document topics."""
+        question_lower = question.lower()
+        topic_patterns = [
+            r"what (are|were|is) the topics",
+            r"what topics",
+            r"(list|show|tell me) (the|) topics",
+            r"what (is|are) this document about",
+            r"main (topics|subjects|themes)"
+        ]
+        
+        return any(re.search(pattern, question_lower) for pattern in topic_patterns)
+
+    def _answer_topic_question(self, question: str) -> Dict[str, Any]:
+        """Answer a question about document topics."""
+        try:
+            # Get topics from retrieval system
+            topics = self.retrieval_system.get_available_topics()
+            
+            if topics:
+                answer = f"I found these main topics in your documents: {', '.join(topics)}"
+            else:
+                answer = "I couldn't identify any clear topics in your documents."
+                
+            return {
+                "answer": answer,
+                "confidence": 0.9,
+                "sources": []
+            }
+        except Exception as e:
+            logger.error(f"Error answering topic question: {e}")
+            return {
+                "answer": "I encountered an error while trying to identify topics in your documents.",
+                "confidence": 0.0,
+                "sources": []
+            }
