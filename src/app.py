@@ -18,6 +18,7 @@ from retrieval import RetrievalSystem
 from dialogflow_integration import DialogflowIntegration  
 from intent_handler import IntentHandlerManager, SessionState
 from abstractive_summarizer import AbstractiveSummarizer 
+from news_extractive_summarizer import NewsExtractiveSummarizer
 from document_qa import DocumentQA  
 
 # Set up logging
@@ -25,8 +26,8 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 # Set avatars
-user_avatar = None
-assistant_avatar = None
+user_avatar = "../test/app/avatar.JPG"
+assistant_avatar = "../test/app/summi.JPG"
 
 # Initialize session state
 if 'initialized' not in st.session_state:
@@ -38,9 +39,12 @@ if 'initialized' not in st.session_state:
     st.session_state.awaiting_response = False
     st.session_state.processing_type = None 
     st.session_state.processing_start_time = None
-    st.session_state.show_processing = False  # Processing display flag
-    st.session_state.processing_message = ""  # Message to show during processing
-    st.session_state.session_id = str(uuid.uuid4())  # Unique session ID for Dialogflow
+    st.session_state.show_processing = False
+    st.session_state.processing_message = ""
+    st.session_state.session_id = str(uuid.uuid4())
+    st.session_state.pending_summarization = None
+    st.session_state.pending_confirmation = False
+    st.session_state.awaiting_article_input = False  # New state for awaiting article input
 
 def initialize_systems():
     """Initialize all the required systems."""
@@ -77,7 +81,10 @@ def initialize_systems():
         retrieval_system=st.session_state.retrieval_system,
         use_ollama=True
     )
-    
+    # Extractive summarizer
+    st.session_state.news_extractive_summarizer = NewsExtractiveSummarizer(
+        model_path='models/fine_tuned_bart'
+    )
     # Document QA
     st.session_state.document_qa = DocumentQA(
         retrieval_system=st.session_state.retrieval_system,
@@ -89,6 +96,7 @@ def initialize_systems():
         document_processor=st.session_state.document_processor,
         retrieval_system=st.session_state.retrieval_system,
         abstractive_summarizer=st.session_state.abstractive_summarizer,
+        news_extractive_summarizer=st.session_state.news_extractive_summarizer,
         document_qa=st.session_state.document_qa
     )
     
@@ -213,85 +221,175 @@ def process_uploaded_file(uploaded_file, is_part_of_batch=False):
             add_message("assistant", assistant_avatar, f"Failed to process '{uploaded_file.name}': {str(e)}")
         return False
 
+def detect_summarization_intent(text):
+    """
+    Detect if the text appears to be a summarization request.
+    Returns:
+        tuple: (is_summarization, text_to_summarize) or (False, None)
+    """
+    # Check if text exceeds Dialogflow's limit
+    if len(text) > 250:
+        # Define summarization prefixes and check for them
+        summarize_prefixes = [
+            "summarize this:", 
+            "can you summarize this:", 
+            "could you summarize this:", 
+            "please summarize this:", 
+            "summarize the following:", 
+            "summary of this:",
+            "provide an extractive summary for the following:",
+            "provide a summary of:"
+        ]
+        
+        # Check if the text starts with a summarization prefix
+        for prefix in summarize_prefixes:
+            if text.lower().startswith(prefix):
+                return True, text[len(prefix):].strip()
+        
+        # Check keywords to identify summarization requests
+        summarization_keywords = ["summary", "summarize", "summarization", "extract", "extractive"]
+        has_summarization_keyword = any(keyword in text.lower() for keyword in summarization_keywords)
+        
+        # If it contains keywords and is long enough, it might be content to summarize
+        if has_summarization_keyword and len(text.split()) > 100:
+            return True, text
+        
+        # If it's just long text with no explicit summarization request, mark as candidate
+        if len(text) > 300 and "?" not in text and len(text.split()) > 100:
+            return "candidate", text
+    
+    return False, None
+
 def handle_user_input(user_input: str):
-    """
-    Process user input and generate a response.
-    This function adds the user message to history and marks it for processing.
-    """
+    """Process user input and generate a response."""
     if not user_input:
         return
     
-    # Add user message to history
+    # Check if we're awaiting article input for summarization
+    if st.session_state.awaiting_article_input:
+        add_message("user", user_avatar, user_input)
+        st.session_state.awaiting_article_input = False
+        st.session_state.show_processing = True
+        st.session_state.direct_summarize = user_input
+        st.rerun()
+        return
+    
+    # Check if we're waiting for a confirmation
+    if st.session_state.pending_confirmation:
+        # Handle confirmation for pending summarization
+        affirmative_responses = ["yes", "yeah", "sure", "ok", "okay", "summarize", "please summarize"]
+        
+        if any(user_input.lower().strip() == resp for resp in affirmative_responses):
+            # User confirmed summarization
+            text_to_summarize = st.session_state.pending_summarization
+            add_message("user", user_avatar, user_input)
+            st.session_state.show_processing = True
+            st.session_state.pending_confirmation = False
+            st.session_state.pending_summarization = None    
+            st.rerun()
+            st.session_state.direct_summarize = text_to_summarize
+            return
+        else:
+            # User declined summarization
+            add_message("user", user_avatar, user_input)
+            add_message("assistant", assistant_avatar, "I won't summarize the text. How else can I help you?")
+            st.session_state.pending_confirmation = False
+            st.session_state.pending_summarization = None
+            st.session_state.show_processing = True
+            st.rerun()
+            return
+    
+    # Standard processing for other messages
     add_message("user", user_avatar, user_input)
-    
-    # Set up processing state to show a spinner
     st.session_state.show_processing = True
-    
-    # Force a rerun to update the UI and show the processing indicator
     st.rerun()
 
 def generate_assistant_response():
-    """
-    Process the most recent user message and generate a response.
-    This is called only when show_processing is True.
-    """
+    """Process the most recent user message and generate a response."""
     try:
         # Add a slight delay before responding
         time.sleep(0.3)
 
+        # Check if we need to directly summarize text
+        if hasattr(st.session_state, 'direct_summarize') and st.session_state.direct_summarize:
+            text_to_summarize = st.session_state.direct_summarize
+            
+            # Check if text is long enough for summarization
+            if len(text_to_summarize.split()) < 50:
+                response_text = "The provided text is too short for effective summarization. Please provide a longer text (at least 50 words)."
+            else:
+                # Generate summary
+                logger.info(f"Directly summarizing text of length: {len(text_to_summarize)}")
+                try:
+                    summary = st.session_state.news_extractive_summarizer.summarize(text_to_summarize)
+                    response_text = "Extractive Summary:\n\n" + summary
+                except Exception as e:
+                    logger.error(f"Error in direct summarization: {e}", exc_info=True)
+                    response_text = "An error occurred during summarization. Please try again with different text."
+            
+            # Add response to messages
+            add_message("assistant", assistant_avatar, response_text)
+            st.session_state.direct_summarize = None
+            st.session_state.show_processing = False
+            st.rerun()
+            return
+        
         # Get the most recent user message
         user_input = st.session_state.messages[-1]["content"]
         
         # Use Dialogflow to determine intent
-        intent_data = st.session_state.dialogflow.detect_intent(
-            user_input,
-            st.session_state.session_id
-        )
+        try:
+            intent_data = st.session_state.dialogflow.detect_intent(
+                user_input,
+                st.session_state.session_id
+            )
         
-        intent_type = intent_data.get("intent", "fallback")
-        
+            intent_type = intent_data.get("intent", "fallback")
+            intent_data["raw_text"] = user_input
+            
+            # Check for fallback due to text length
+            if intent_type == "fallback" and len(user_input) > 250:
+                intent_data["is_fallback"] = True
+                
+                # Try to detect summarization intent for long text
+                is_summary, text_to_summarize = detect_summarization_intent(user_input)
+                if is_summary:
+                    intent_type = "Extractive_summarizer_news_articles"
+        except Exception as e:
+            logger.error(f"Error detecting intent: {str(e)}")
+            intent_type = "fallback"
+            intent_data = {
+                "raw_text": user_input,
+                "is_fallback": True
+            }
+
         # Process the intent
         response = st.session_state.intent_handler.handle_intent(intent_type, intent_data)
+        response_text = response.get("text", "I'm not sure how to respond to that.")
         
-        # Check for special forward instruction (e.g., to extractive summarization)
-        if "forward_to" in response:
-            # Handle forwarding to external modules
-            forward_to = response.get("forward_to")
-            if forward_to == "extractive_summarization":
-                # This would be handled by your groupmates' module
-                # For now, return a placeholder message
-                response_text = "The extractive summarization request has been forwarded to the external module."
-            else:
-                response_text = response.get("text", "Your request has been forwarded.")
-        else:
-            response_text = response.get("text", "I'm not sure how to respond to that.")
-        
+        # Handle special response flags
+        if response.get("awaiting_article"):
+            st.session_state.awaiting_article_input = True
+            
+        if response.get("requires_confirmation"):
+            st.session_state.pending_confirmation = True
+            st.session_state.pending_summarization = response.get("pending_text")
+          
         # Prepare message kwargs for special data
         message_kwargs = {}
-        
-        # Include summary data if present
         if "summary" in response:
             message_kwargs["summary"] = response["summary"]
-        
-        # Include QA result if present
         if "qa_result" in response:
             message_kwargs["qa_result"] = response["qa_result"]
                 
-        # Add assistant message to history with any special data
+        # Add assistant message to history
         add_message("assistant", assistant_avatar, response_text, **message_kwargs)
-
-        # Reset processing indicators
         st.session_state.show_processing = False
-
-        # Force a rerun to update the UI with the message
         st.rerun()
         
     except Exception as e:
-        # Handle errors gracefully
         logger.error(f"Error processing response: {str(e)}")
         add_message("assistant", assistant_avatar, f"I encountered an error while processing your request. Please try again or try rephrasing your message.")
-    finally:
-        # Reset processing indicators
         st.session_state.show_processing = False
 
 def main():

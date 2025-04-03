@@ -1,6 +1,6 @@
 # abstractive_summarizer.py
 import logging
-from typing import List, Dict, Any, Optional
+from typing import List, Dict, Any, Optional, Tuple, Set
 import numpy as np
 import requests
 import json
@@ -77,6 +77,51 @@ class AbstractiveSummarizer:
         
         return processed_context
 
+    def _validate_citations(self, text: str, sources: List[Dict[str, Any]]) -> Tuple[str, Set[int]]:
+        """
+        Validate citations in the text and remove any that don't correspond to actual sources.
+        
+        Args:
+            text: The text containing potential citations
+            sources: List of source dictionaries with 'index' keys
+            
+        Returns:
+            Tuple of (cleaned_text, set of valid citation indices used)
+        """
+        if not sources:
+            # If no sources, remove all citation-like patterns
+            cleaned_text = re.sub(r'\[\d+\]', '', text)
+            return cleaned_text, set()
+        
+        # Get the valid source indices
+        valid_indices = {source['index'] for source in sources}
+        
+        # Find all citation-like patterns
+        citation_pattern = r'\[(\d+)\]'
+        
+        # Function to replace invalid citations in the re.sub function
+        def replace_invalid_citation(match):
+            citation_num = int(match.group(1))
+            if citation_num in valid_indices:
+                # Keep valid citations
+                return match.group(0)
+            else:
+                # Remove invalid citations
+                return ''
+        
+        # Replace invalid citations
+        cleaned_text = re.sub(citation_pattern, replace_invalid_citation, text)
+        
+        # Find all remaining (valid) citations
+        valid_citations = set()
+        for match in re.finditer(citation_pattern, cleaned_text):
+            try:
+                valid_citations.add(int(match.group(1)))
+            except ValueError:
+                continue
+                
+        return cleaned_text, valid_citations
+
     def generate_summary(self, length: str = "medium", focus_topics: Optional[List[str]] = None) -> Dict[str, Any]:
         """
         Generate an abstractive summary of the documents in the vector store.
@@ -90,8 +135,8 @@ class AbstractiveSummarizer:
         """
         # Map length to token/word targets
         length_targets = {
-            "short": {"words": 100, "description": "concise"},
-            "medium": {"words": 250, "description": "comprehensive"},
+            "short": {"words": 50, "description": "concise"},
+            "medium": {"words": 200, "description": "comprehensive"},
             "long": {"words": 500, "description": "detailed"}
         }
         
@@ -120,7 +165,7 @@ class AbstractiveSummarizer:
         for query in queries:
             contexts = self.retrieval_system.retrieve(
                 query=query,
-                top_k=5  # Get top 5 results per query
+                top_k=100
             )
             all_contexts.extend(contexts)
         
@@ -133,9 +178,6 @@ class AbstractiveSummarizer:
         
         # Convert back to list and sort by score
         contexts = sorted(unique_contexts.values(), key=lambda x: x["similarity"], reverse=True)
-        
-        # Limit to the top contexts to avoid exceeding context limits
-        contexts = contexts[:num_contexts]
         
         if not contexts:
             return {
@@ -150,11 +192,11 @@ class AbstractiveSummarizer:
         # Create a mapping of contexts to their source information for citation
         context_sources = {}
         sources = []
-        
+
         for i, ctx in enumerate(contexts):
             if "metadata" in ctx and "source" in ctx["metadata"]:
                 source = ctx["metadata"]["source"]
-                page = ctx["metadata"].get("page_number", "")
+                page = ctx["metadata"].get("page_number", "")  # Get page_number from metadata
                 source_info = {"title": source, "page": page, "index": len(sources) + 1}
                 
                 # Find unique sources
@@ -171,6 +213,7 @@ class AbstractiveSummarizer:
                 # Map context to its source for citation
                 context_sources[i] = source_info
         
+
         # Extract metadata about the sources and topics
         source_documents = set()
         topics = set()
@@ -212,30 +255,38 @@ class AbstractiveSummarizer:
         if not summary:
             summary = self._generate_simple_summary_with_citations(context_text, target, sources)
         
+        # After generating the summary, validate and clean citations
+        cleaned_summary, used_citation_indices = self._validate_citations(summary, sources)
+        
+        # Add a sources section at the end, but only for citations that were actually used
         sources_text = ""
-        if sources:
-            # If no citations were used but we have sources, include all sources
-            sources_text = "\n\nSources:\n"
+        if used_citation_indices:  # Only add sources section if citations were used
+            sources_text = "\n\nSources:"
             for source in sources:
-                sources_text += f"\n\n[{source['index']}] {source['title']}"
-                if source['page']:
-                    sources_text += f", page {source['page']}"
-                sources_text += "\n"
+                # Only include sources that were actually cited in the answer/summary
+                if source['index'] in used_citation_indices:
+                    sources_text += f"\n\n[{source['index']}] {source['title']}"
+                    if source['page']:  # Simply check if page has a truthy value
+                        sources_text += f", page {source['page']}"
+                    sources_text += "\n"
+        
+        # Filter sources to only include those that were used
+        used_sources = [s for s in sources if s['index'] in used_citation_indices]
         
         # Return with metadata
         return {
-            "summary": summary,
-            "summary_with_sources": summary + sources_text,  # Now includes sources based on conditional logic
+            "summary": cleaned_summary,
+            "summary_with_sources": cleaned_summary + sources_text if sources_text else cleaned_summary,
             "metadata": {
                 "length": length,
-                "word_count": len(summary.split()),
+                "word_count": len(cleaned_summary.split()),
                 "focus_topics": list(topics) if focus_topics is None else focus_topics,
                 "source_documents": list(source_documents),
                 "context_count": len(contexts),
-                "sources": sources,  # All available sources
+                "sources": used_sources,
             }
         }
-
+        
     def _generate_with_ollama(self, context: str, target: Dict[str, Any], sources: List[Dict[str, Any]]) -> str:
         """Generate a summary using Ollama with embedded citations."""
         import requests
@@ -283,22 +334,13 @@ class AbstractiveSummarizer:
             citation_instructions = f"""
             CITATION REQUIREMENTS (VERY IMPORTANT):
             1. ONLY use these specific citation numbers: {valid_citations}
-            2. DO NOT create your own citation numbers like [21], [22], etc.
-            3. When citing, use EXACTLY the citation numbers from the Context sections.
-            4. For Context 1 [1], use citation [1]. For Context 5 [3], use citation [3].
-            5. Place citations [X] immediately after the specific information they support.
-            6. Do not group citations at the end of sentences or paragraphs.
-            7. Each piece of information should be cited individually.
-            8. Do not reference context numbers in your summary (e.g., do not write "as mentioned in Context 3").
-            9. Include at least one citation in each key point and multiple citations in the main summary.
-            10. The citations in your summary MUST MATCH the source numbers provided in the context.
-            11. Some context passages may contain references in the format (document reference X)
-            12. These are existing citations from the original document
-            13. DO NOT reproduce these as [X] in your summary
-                        
-            CITATION EXAMPLE:
-            WRONG: "The study showed significant results for multiple metrics [21]."
-            RIGHT: "The study showed significant results for multiple metrics [3]." (assuming Context N [3])
+            2. When citing, use EXACTLY the citation numbers from the Context sections.
+            3. Place citations [X] immediately after the specific information they support.
+            4. Do not group citations at the end of sentences or paragraphs.
+            5. Each piece of information should be cited individually.
+            6. Do not reference context numbers in your summary (e.g., do not write "as mentioned in Context 3").
+            7. Include at least one citation in each key point and multiple citations in the main summary.
+            8. The citations in your summary MUST MATCH the source numbers provided in the context.
             """
         
         return f"""

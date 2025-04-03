@@ -1,6 +1,6 @@
 # document_qa.py
 import logging
-from typing import List, Dict, Any, Optional
+from typing import List, Dict, Any, Optional, Tuple, Set
 import os
 import requests
 import json
@@ -76,6 +76,51 @@ class DocumentQA:
         processed_context = re.sub(existing_citation_pattern, replace_citation, context_text)
         
         return processed_context
+
+    def _validate_citations(self, text: str, sources: List[Dict[str, Any]]) -> Tuple[str, Set[int]]:
+        """
+        Validate citations in the text and remove any that don't correspond to actual sources.
+        
+        Args:
+            text: The text containing potential citations
+            sources: List of source dictionaries with 'index' keys
+            
+        Returns:
+            Tuple of (cleaned_text, set of valid citation indices used)
+        """
+        if not sources:
+            # If no sources, remove all citation-like patterns
+            cleaned_text = re.sub(r'\[\d+\]', '', text)
+            return cleaned_text, set()
+        
+        # Get the valid source indices
+        valid_indices = {source['index'] for source in sources}
+        
+        # Find all citation-like patterns
+        citation_pattern = r'\[(\d+)\]'
+        
+        # Function to replace invalid citations in the re.sub function
+        def replace_invalid_citation(match):
+            citation_num = int(match.group(1))
+            if citation_num in valid_indices:
+                # Keep valid citations
+                return match.group(0)
+            else:
+                # Remove invalid citations
+                return ''
+        
+        # Replace invalid citations
+        cleaned_text = re.sub(citation_pattern, replace_invalid_citation, text)
+        
+        # Find all remaining (valid) citations
+        valid_citations = set()
+        for match in re.finditer(citation_pattern, cleaned_text):
+            try:
+                valid_citations.add(int(match.group(1)))
+            except ValueError:
+                continue
+                
+        return cleaned_text, valid_citations
 
     def answer_question_with_context(self, question: str, conversation_history: List[Dict[str, str]], 
                             max_context_items: int = 100) -> Dict[str, Any]:
@@ -187,27 +232,34 @@ class DocumentQA:
             answer = answer_data["answer"]
             confidence = answer_data["confidence"]
         
-        # Add a sources section at the end using conditional logic
+        # After generating the answer, validate and clean citations
+        cleaned_answer, used_citation_indices = self._validate_citations(answer, sources)
+        
+        # Add a sources section at the end, but only for citations that were actually used
         sources_text = ""
-        if sources:
-            # If no citations were used but we have sources, include all sources
-            sources_text = "\n\nSources:\n"
+        if used_citation_indices:  # Only add sources section if citations were used
+            sources_text = "\n\nSources:"
             for source in sources:
-                sources_text += f"\n\n[{source['index']}] {source['title']}"
-                if source['page']:
-                    sources_text += f", page {source['page']}"
-                sources_text += "\n"
-
+                # Only include sources that were actually cited in the answer
+                if source['index'] in used_citation_indices:
+                    sources_text += f"\n\n[{source['index']}] {source['title']}"
+                    if source['page']:
+                        sources_text += f", page {source['page']}"
+                    sources_text += "\n"
+        
+        # Filter sources to only include those that were used
+        used_sources = [s for s in sources if s['index'] in used_citation_indices]
+        
         # Return with metadata
         result = {
-            "answer": answer,
+            "answer": cleaned_answer,
             "confidence": confidence,
-            "sources": sources,  # Include all sources if none were cited
-            "answer_with_citations": answer + sources_text
+            "sources": used_sources,
+            "answer_with_citations": cleaned_answer + sources_text if sources_text else cleaned_answer
         }
         
         return result
-
+        
     def _detect_followup_question(self, question: str) -> bool:
         """
         Detect if a question is likely a follow-up to a previous question.
@@ -331,22 +383,13 @@ class DocumentQA:
             citation_instructions = f"""
             CITATION REQUIREMENTS (VERY IMPORTANT):
             1. ONLY use these specific citation numbers: {valid_citations}
-            2. DO NOT create your own citation numbers like [21], [22], etc.
-            3. When citing, use EXACTLY the citation numbers from the Context sections.
-            4. For Context 1 [1], use citation [1]. For Context 5 [3], use citation [3].
-            5. Place citations [X] immediately after the specific information they support.
-            6. Do not group citations at the end of sentences or paragraphs.
-            7. Each piece of information should be cited individually.
-            8. Do not reference context numbers in your answer (e.g., do not write "as mentioned in Context 3").
-            9. Include at least one citation in your answer, preferably multiple citations for different pieces of information.
-            10. The citations in your answer MUST MATCH the source numbers provided in the context.
-            11. Some context passages may contain references in the format (document reference X)
-            12. These are existing citations from the original document
-            13. DO NOT reproduce these as [X] in your summary
-            
-            CITATION EXAMPLE:
-            WRONG: "The product launched in March 2022 with positive reception [21]."
-            RIGHT: "The product launched in March 2022 [2] with positive reception [4]." (assuming Context 2 [2] and Context 4 [4])
+            2. When citing, use EXACTLY the citation numbers from the Context sections.
+            3. Place citations [X] immediately after the specific information they support.
+            4. Do not group citations at the end of sentences or paragraphs.
+            5. Each piece of information should be cited individually.
+            6. Do not reference context numbers in your answer (e.g., do not write "as mentioned in Context 3").
+            7. Include at least one citation in your answer, preferably multiple citations for different pieces of information.
+            8. The citations in your answer MUST MATCH the source numbers provided in the context.
             """
         
         return f"""

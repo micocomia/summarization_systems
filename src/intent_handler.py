@@ -3,7 +3,6 @@ import logging
 import re
 import os
 from typing import Dict, Any, List, Optional
-from google.protobuf.json_format import MessageToJson
 
 logger = logging.getLogger(__name__)
 
@@ -31,6 +30,7 @@ class IntentHandlerManager:
                  document_processor=None, 
                  retrieval_system=None,
                  abstractive_summarizer=None,
+                 news_extractive_summarizer=None,
                  document_qa=None):
         """
         Initialize the intent handler.
@@ -44,6 +44,7 @@ class IntentHandlerManager:
         self.document_processor = document_processor
         self.retrieval_system = retrieval_system
         self.abstractive_summarizer = abstractive_summarizer
+        self.news_extractive_summarizer = news_extractive_summarizer
         self.document_qa = document_qa
         
         # Initialize session state
@@ -74,15 +75,15 @@ class IntentHandlerManager:
         # Map intent types to handler methods
         intent_handlers = {
             "SummaryTask_Abstractive": self._handle_abstractive_summarization,
-            "extractive_summarization": self._handle_extractive_summarization,
-            "QA_Document": self._handle_document_qa,
+            "Extractive_summarizer_news_articles": self._handle_extractive_summarization_news,
+            "document_qa": self._handle_document_qa,
             "summarization_info": self._handle_summarization_info,
             "show_settings": self._handle_show_settings,
             "upload_document": self._handle_upload_document,
-            "Document_Status": self._handle_document_status,
-            "FallbackIntent": self._handle_fallback
+            "list_documents": self._handle_list_documents,
+            "fallback": self._handle_fallback
         }
-
+        
         # Call the appropriate handler
         if intent_type in intent_handlers:
             response = intent_handlers[intent_type](intent_data)
@@ -94,49 +95,6 @@ class IntentHandlerManager:
                 response = self._handle_fallback(intent_data)
                 
         return response
-
-    def extract_sys_any_protobuf(parameter):
-        """
-        Extract values from a Dialogflow sys.any parameter using Protobuf's JSON converter.
-        
-        Args:
-            parameter: A protobuf message object (like from Dialogflow's sys.any)
-            
-        Returns:
-            Extracted value(s) as Python native types
-        """
-        try:
-            # Convert protobuf message to JSON string
-            serialized = MessageToJson(parameter)
-            
-            # Parse JSON string back to Python dict/list
-            parsed = json.loads(serialized)
-            
-            # Debug output
-            logger.debug(f"Converted protobuf to: {parsed}")
-            
-            # Extract values from common Dialogflow structures
-            if isinstance(parsed, dict):
-                # Try various common field names in Dialogflow responses
-                for field in ['values', 'items', 'listValue', 'value', 'stringValue']:
-                    if field in parsed:
-                        return parsed[field]
-                
-                # If there's only one key, return its value
-                if len(parsed) == 1:
-                    return list(parsed.values())[0]
-                
-                # Return the whole dict if we couldn't extract a specific field
-                return parsed
-            
-            return parsed
-        except Exception as e:
-            logger.error(f"Error converting protobuf to JSON: {str(e)}")
-            # Fallback to string representation if JSON conversion fails
-            try:
-                return str(parameter)
-            except:
-                return None
     
     def _handle_abstractive_summarization(self, intent_data: Dict[str, Any]) -> Dict[str, Any]:
         """Handle abstractive summarization intent."""
@@ -170,25 +128,12 @@ class IntentHandlerManager:
                 length=summary_length,
                 focus_topics=focus_topics if focus_topics else None
             )
-            
-            # Use the summary with embedded citations and sources
-            if "summary_with_sources" in summary_result:
-                # This is the summary text with citations and source list at the end
-                response_text = summary_result["summary_with_sources"]
-            else:
-                # Fallback to older format if the new field isn't available
-                summary_text = summary_result["summary"]
-                metadata = summary_result["metadata"]
-                
-                source_info = ""
-                if "source_documents" in metadata and metadata["source_documents"]:
-                    source_docs = metadata["source_documents"]
-                    source_info = f"\n\n\nSource(s): {', '.join(source_docs)}"
-                
-                response_text = f"{summary_text}{source_info}"
-            
+
+            # Build response with summary and metadata
+            summary_text = summary_result["summary_with_sources"]
+                        
             return {
-                "text": response_text,
+                "text": summary_text,
                 "summary": summary_result
             }
             
@@ -197,13 +142,81 @@ class IntentHandlerManager:
             return {
                 "text": "I encountered an error while trying to generate a summary. Please try again or try with different settings."
             }
-        
-    def _handle_extractive_summarization(self, intent_data: Dict[str, Any]) -> Dict[str, Any]:
-        """Handle extractive summarization intent."""
-        return {
-                "text": "Extractive summary not done."
-            }
     
+    def _handle_extractive_summarization_news(self, intent_data: Dict[str, Any]) -> Dict[str, Any]:
+        """
+        Handle the intent for extractive summarization of news articles or any text input.
+        Implements a two-step process to work around Dialogflow's 256-character limit.
+        """
+        try:
+            # Get the original raw text from the request
+            raw_text = intent_data.get("raw_text", "")
+            
+            # Define phrases that indicate a request for summarization capability
+            initial_summarization_phrases = [
+                "generate an extractive summary", 
+                "create an extractive summary",
+                "i want an extractive summary", 
+                "provide an extractive summary",
+                "i need an extractive summary",
+                "extractive summary of a news article",
+                "summarize a news article",
+                "extractive summary of an article",
+                "extractive summarization"
+            ]
+            
+            # Check if this is just asking for summarization capability
+            is_initial_request = any(phrase in raw_text.lower() for phrase in initial_summarization_phrases)
+            has_article_text = len(raw_text.split()) > 50  # Assuming articles have more than 50 words
+            
+            # If this is a request for summarization without article text, prompt for it
+            if is_initial_request and not has_article_text:
+                return {
+                    "text": "I'd be happy to create an extractive summary for you. Please enter the news article or text you want me to summarize in the chat.",
+                    "awaiting_article": True
+                }
+                
+            # If we have text to summarize, proceed with summarization
+            if has_article_text:
+                text_to_summarize = raw_text
+            else:
+                # Try to extract text to summarize from patterns
+                summarize_prefixes = [
+                    "summarize this:", 
+                    "can you summarize this:", 
+                    "could you summarize this:", 
+                    "please summarize this:", 
+                    "summarize the following:", 
+                    "summary of this:", 
+                    "provide an extractive summary for the following:",
+                    "provide a summary of:"
+                ]
+                
+                # Extract text to summarize based on prefixes
+                text_to_summarize = raw_text
+                for prefix in summarize_prefixes:
+                    if raw_text.lower().startswith(prefix):
+                        text_to_summarize = raw_text[len(prefix):].strip()
+                        break
+                        
+            # Check if text is too short for meaningful summarization
+            if len(text_to_summarize.split()) < 50:
+                return {"text": "The provided text is too short for effective summarization. Please provide a longer text (at least 50 words)."}
+            
+            # Generate the summary
+            try:
+                logger.info(f"Summarizing text of length: {len(text_to_summarize)}")
+                summary = self.news_extractive_summarizer.summarize(text_to_summarize)
+                return {"text": "Extractive Summary:\n\n" + summary}
+            except Exception as e:
+                logger.error(f"Error in extractive summarization: {e}", exc_info=True)
+                return {"text": "An error occurred during summarization. Please try again with different text."}
+        
+        except Exception as e:
+            logging.error(f"Error in _handle_extractive_summarization_news: {e}", exc_info=True)
+            return {"text": "An error occurred during summarization. Please try again with different text."}
+
+        
     def _handle_document_qa(self, intent_data: Dict[str, Any]) -> Dict[str, Any]:
         """Handle document QA intent with conversation context."""
         if not self.session.documents_loaded:
@@ -268,7 +281,7 @@ class IntentHandlerManager:
         return {
             "text": response
         }
-    
+     
     def _handle_show_settings(self, intent_data: Dict[str, Any]) -> Dict[str, Any]:
         """Show current summary settings."""
         settings = self.session.settings
@@ -322,58 +335,6 @@ class IntentHandlerManager:
         return {
             "text": "To upload a document, you can use the file upload button below. I support PDF and PPTX files."
         }
-
-    def _handle_document_status(self, intent_data: Dict[str, Any]) -> Dict[str, Any]:
-        """
-        Handle requests to check status of uploaded documents and their topics.
-        
-        Args:
-            intent_data: Intent data from Dialogflow
-            
-        Returns:
-            Response with document status information
-        """
-        if not self.session.documents_loaded:
-            return {
-                "text": "You haven't uploaded any documents yet. Use the file upload button to add documents."
-            }
-        
-        # Get list of document names
-        document_names = self.session.document_names if hasattr(self.session, 'document_names') else []
-        
-        # Get topics from the retrieval system
-        topics = []
-        try:
-            if self.retrieval_system:
-                topics = self.retrieval_system.get_available_topics()
-        except Exception as e:
-            logger.error(f"Error retrieving topics: {str(e)}")
-        
-        # Build the response
-        doc_count = len(document_names)
-        response_text = f"You have {doc_count} document{'s' if doc_count != 1 else ''} uploaded:\n\n"
-        
-        # List documents
-        for i, doc_name in enumerate(document_names):
-            response_text += f"{i+1}. {doc_name}\n"
-        
-        # Add topics section if any were found
-        if topics:
-            response_text += f"\nI've identified the following topics in your documents:\n"
-            for topic in topics:
-                response_text += f"- {topic}\n"
-        else:
-            response_text += "\nNo specific topics were identified in your documents."
-        
-        # Add instructions for what they can do next
-        response_text += "\n\nYou can now:\n"
-        response_text += "- Ask for an abstractive summary (short, medium, or long)\n"
-        response_text += "- Ask questions about specific content in the documents\n"
-        response_text += "- Request a summary focused on specific topics"
-        
-        return {
-            "text": response_text
-    }
     
     def _handle_list_documents(self, intent_data: Dict[str, Any]) -> Dict[str, Any]:
         """List currently loaded documents."""
@@ -389,19 +350,44 @@ class IntentHandlerManager:
         }
     
     def _handle_fallback(self, intent_data: Dict[str, Any]) -> Dict[str, Any]:
-        """Handle fallback intent."""
-        # Get the fulfillment text from Dialogflow if available
+        """Handle fallback intent with improved detection of summarization requests."""
+        # Get the raw text if available
+        raw_text = intent_data.get("raw_text", "")
 
-        if not self.session.documents_loaded:
-            response = "Hello! You can upload documents using the file button below, or ask me about summarization systems."
-        else:
-            try:
+        # Check if this might be a summarization request
+        if len(raw_text) > 250:
+            # Check for summarization-related keywords
+            summarization_keywords = [
+                "summary", "summarize", "summarization", "extract", "extractive"
+            ]
+            
+            if any(keyword in raw_text.lower() for keyword in summarization_keywords):
+                # Check if this contains enough text to summarize
+                if len(raw_text.split()) > 100:
+                    # It likely contains both a request and content to summarize
+                    return self._handle_extractive_summarization_news({
+                        "raw_text": raw_text,
+                        "is_fallback": True
+                    })
+                else:
+                    # Likely just asking for summarization capability
+                    return {
+                        "text": "I'd be happy to create an extractive summary for you. Please enter the news article or text you want me to summarize in the chat.",
+                        "awaiting_article": True
+                    }
+
+        # Original fallback logic
+        response = intent_data.get("fulfillment_text", "")
+
+        if not response:
+            if not self.session.documents_loaded:
+                response = "I didn't understand that. You can upload documents using the file button below, or ask me about summarization systems."
+            else:
+                response = "I didn't understand that. Since you have documents loaded, I'll try to answer as a question about your documents.\n\n"
                 # Try to handle as a document QA intent
                 qa_response = self._handle_document_qa(intent_data)
                 response += qa_response["text"]
-            except:
-                response = "I tried querying the document but was unable to find anything."
-        
+
         return {
             "text": response
         }
