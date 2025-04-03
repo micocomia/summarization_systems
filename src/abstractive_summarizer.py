@@ -144,7 +144,7 @@ class AbstractiveSummarizer:
         
         # Retrieve relevant contexts for summarization
         # For summarization, we want broad coverage of the document(s)
-        num_contexts = 1000  # Retrieve more contexts for full coverage
+        num_contexts = 50  # Retrieve more contexts for full coverage
         
         # Build diverse retrieval queries to get good coverage
         queries = [
@@ -165,7 +165,7 @@ class AbstractiveSummarizer:
         for query in queries:
             contexts = self.retrieval_system.retrieve(
                 query=query,
-                top_k=100
+                top_k=10
             )
             all_contexts.extend(contexts)
         
@@ -178,6 +178,9 @@ class AbstractiveSummarizer:
         
         # Convert back to list and sort by score
         contexts = sorted(unique_contexts.values(), key=lambda x: x["similarity"], reverse=True)
+
+        # Limit to 1000 contexts
+        contexts = contexts[:num_contexts]
         
         if not contexts:
             return {
@@ -238,7 +241,7 @@ class AbstractiveSummarizer:
             processed_content = self._preprocess_context_citations(ctx['content'])
             
             # Add to processed context text
-            context_text += f"Context {i+1}{citation}:\n{processed_content}\n\n"
+            context_text += f"{processed_content}{citation}\n\n"
         
         # Generate the summary
         summary = ""

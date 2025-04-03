@@ -55,8 +55,8 @@ def initialize_systems():
     # Document Processor
     st.session_state.document_processor = DocumentProcessor(
         embedding_model="all-MiniLM-L6-v2",
-        chunk_size=1000,
-        chunk_overlap=100,
+        chunk_size=500,
+        chunk_overlap=150,
     )
 
     # Vector store for document storage
